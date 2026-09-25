@@ -76,6 +76,7 @@ jobs:
             BID="com.anydesk.AnyDesk"
           fi
           echo "AnyDesk bundle id: $BID"
+          echo "ANYDESK_BID=$BID" >> "$GITHUB_ENV"
 
           TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
           grant_tcc() {
@@ -95,14 +96,18 @@ jobs:
           mkdir -p "$HOME/.anydesk"
 
           # Unattended settings, written to both config files AnyDesk may read.
-          # ad.security.interactive_access=2 → "Never show incoming session requests":
-          # the remote side NEVER gets an accept/deny window. 0 = always ask,
-          # 1 = ask when AnyDesk is open, 2 = only password-authenticated sessions.
+          # ad.security.interactive_access → policy for incoming requests:
+          #   0 = always allow (no accept/deny window, no password needed)
+          #   1 = allow when AnyDesk is open    2 = never show (password only)
+          # The macOS CLI cannot set the unattended password headlessly (as user:
+          # "requires administrator privileges"; as root: cannot reach the service),
+          # so policy 0 is what makes this runner usable: connections are accepted
+          # automatically and nothing has to be clicked on the remote side.
           # ad.features.unattended=true → enable the unattended access feature.
           cat > "$HOME/.anydesk/system.conf" << 'CONFEOF'
           ad.anynet.heared_request=false
           ad.security.password_enabled=true
-          ad.security.interactive_access=2
+          ad.security.interactive_access=0
           ad.features.unattended=true
           ad.features.session_recording=false
           ad.ui.main_dialog.table.column_width.alias=150
@@ -114,14 +119,15 @@ jobs:
 
           cp "$HOME/.anydesk/system.conf" "$HOME/.anydesk/user.conf"
 
-          # Mirror the same settings in the macOS defaults domain
-          defaults write com.anydesk.AnyDesk ad.security.interactive_access -int 2
-          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
-          defaults write com.anydesk.AnyDesk ad.features.unattended -bool true
+          # Mirror the same settings in the app's real defaults domain (bundle id)
+          BID="${ANYDESK_BID:-com.philandro.anydesk}"
+          defaults write "$BID" ad.security.interactive_access -int 0
+          defaults write "$BID" ad.security.password_enabled -bool true
+          defaults write "$BID" ad.features.unattended -bool true
 
           # NOTE: do NOT store the plain-text password here.
           # The password hash is set exclusively by the AnyDesk CLI as root in the next step.
-          echo "AnyDesk configured: no on-screen acceptance for incoming sessions (interactive_access=2)."
+          echo "AnyDesk configured: incoming sessions accepted automatically, nothing to click on the remote side (interactive_access=0)."
 
       - name: Start AnyDesk and set password via CLI
         run: |
@@ -134,14 +140,38 @@ jobs:
           # Give it time to initialize and register with the network
           sleep 15
 
-          # Setting the unattended password requires administrator privileges
-          # ("ERROR: Setting the password requires administrator privileges 501" without sudo — 501 is the runner UID).
-          # sudo is passwordless on GitHub macOS runners. Try both accepted forms (stdin and argument);
-          # they are idempotent writes of the same password. Output is NOT suppressed so failures are visible.
-          echo "--- set-password (stdin, as root) ---"
-          printf '%s\n' "$ANYDESK_PASSWORD" | sudo "$ANYDESK_BIN" --set-password || true
-          echo "--- set-password (argument, as root) ---"
-          sudo "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" || true
+          # Set the unattended password. The macOS CLI needs BOTH admin rights AND
+          # access to the AnyDesk service inside the runner's GUI session, so try
+          # every combination; each attempt is idempotent. AnyDesk prints the
+          # failure reason, so the result is classified from its output.
+          RUNNER_UID=$(id -u)
+          PW_STATUS="failed"
+          for attempt in 1 2 3; do
+            case "$attempt" in
+              1)
+                echo "--- set-password: launchctl asuser + sudo, stdin ---"
+                printf '%s\n' "$ANYDESK_PASSWORD" | sudo launchctl asuser "$RUNNER_UID" "$ANYDESK_BIN" --set-password > /tmp/pw.log 2>&1 || true
+                ;;
+              2)
+                echo "--- set-password: launchctl asuser + sudo, argument ---"
+                sudo launchctl asuser "$RUNNER_UID" "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" > /tmp/pw.log 2>&1 || true
+                ;;
+              3)
+                echo "--- set-password: plain sudo ---"
+                sudo "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" > /tmp/pw.log 2>&1 || true
+                ;;
+            esac
+            cat /tmp/pw.log
+            if ! grep -qiE 'error|could not|unrecognized|invalid|usage' /tmp/pw.log; then
+              PW_STATUS="set"
+              break
+            fi
+          done
+          echo "AnyDesk unattended password: $PW_STATUS"
+          echo "ANYDESK_PW_STATUS=$PW_STATUS" >> "$GITHUB_ENV"
+          if [ "$PW_STATUS" != "set" ]; then
+            echo "::warning::The unattended password could not be set headlessly. Connections are accepted automatically without password — treat the AnyDesk ID as a secret."
+          fi
 
           # Restart AnyDesk so the password (and the TCC grants) are picked up
           pkill -f "$ANYDESK_BIN" 2>/dev/null || true
@@ -153,9 +183,9 @@ jobs:
           # Retrieve the AnyDesk ID using the CLI
           ANYDESK_ID=$("$ANYDESK_BIN" --get-id 2>/dev/null || echo "")
 
-          # Fallback: try reading from defaults
+          # Fallback: read the ID from the app's real defaults domain (bundle id)
           if [ -z "$ANYDESK_ID" ]; then
-            ANYDESK_ID=$(defaults read com.anydesk.AnyDesk "ADAnyDeskID" 2>/dev/null || echo "")
+            ANYDESK_ID=$(defaults read "${ANYDESK_BID:-com.philandro.anydesk}" 2>/dev/null | grep -oE '[0-9]{7,12}' | head -1 || echo "")
           fi
 
           if [ -z "$ANYDESK_ID" ]; then
@@ -168,7 +198,13 @@ jobs:
           echo "## AnyDesk Connection Info" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Password:** (the one you set when triggering this workflow)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$PW_STATUS" = "set" ]; then
+            echo "**Password:** the one you set when triggering this workflow" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**Password:** not set (not possible headlessly on a macOS runner)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "⚠️ Sessions are accepted automatically with no password: anyone with this ID can control the runner, so don't share it and prefer short runs." >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "**Max duration:** $RUN_DURATION_HOURS hour(s)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Download the AnyDesk client from https://anydesk.com/downloads and enter the ID above to connect." >> "$GITHUB_STEP_SUMMARY"

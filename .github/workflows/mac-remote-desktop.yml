@@ -1,0 +1,82 @@
+name: macOS Remote Desktop (AnyDesk)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'How long the desktop stays active (hours, max 6)'
+        required: false
+        default: '6'
+      anydesk_password:
+        description: 'AnyDesk password (set this to connect)'
+        required: true
+        default: 'changeme'
+
+jobs:
+  macos-remote-desktop:
+    runs-on: macos-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate duration input
+        run: |
+          DURATION="${{ github.event.inputs.duration }}"
+          # Clamp to max 6 hours
+          if [ -z "$DURATION" ]; then
+            DURATION=6
+          fi
+          INT_DURATION=$(echo "$DURATION" | awk '{print int($1)}')
+          if [ "$INT_DURATION" -gt 6 ]; then
+            INT_DURATION=6
+          fi
+          if [ "$INT_DURATION" -lt 1 ]; then
+            INT_DURATION=1
+          fi
+          echo "RUN_DURATION_HOURS=$INT_DURATION" >> $GITHUB_ENV
+          echo "Desktop will stay active for $INT_DURATION hour(s) (max 6)."
+
+      - name: Install AnyDesk
+        run: |
+          # Download AnyDesk for macOS
+          curl -L -o AnyDesk.dmg "https://download.anydesk.com/anydesk.dmg"
+          hdiutil attach AnyDesk.dmg
+          cp -R "/Volumes/AnyDesk/AnyDesk.app" /Applications/
+          hdiutil detach "/Volumes/AnyDesk"
+          echo "AnyDesk installed."
+
+      - name: Start AnyDesk and configure password
+        run: |
+          # Launch AnyDesk in the background
+          nohup open -a AnyDesk &
+          sleep 10
+
+          # Set the AnyDesk password via defaults
+          ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
+          defaults write com.anydesk.AnyDesk password "$ANYDESK_PASSWORD"
+
+          # Restart AnyDesk to apply password
+          killall AnyDesk 2>/dev/null || true
+          sleep 3
+          nohup open -a AnyDesk &
+          sleep 10
+
+          # Retrieve the AnyDesk ID (this machine's address)
+          ANYDESK_ID=$(defaults read com.anydesk.AnyDesk "ADAnyDeskID" 2>/dev/null || echo "unknown")
+          echo "## AnyDesk Connection Info" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Password:** (the one you set when triggering this workflow)" >> $GITHUB_STEP_SUMMARY
+          echo "**Max duration:** $RUN_DURATION_HOURS hour(s)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download the AnyDesk client from https://anydesk.com/downloads and enter the ID above to connect." >> $GITHUB_STEP_SUMMARY
+          echo ""
+          echo "::warning::AnyDesk ID: $ANYDESK_ID — use the password you set to connect."
+
+      - name: Keep desktop alive for the configured duration
+        run: |
+          END_TIME=$((SECONDS + RUN_DURATION_HOURS * 3600))
+          echo "Keeping session alive for $RUN_DURATION_HOURS hour(s)..."
+          while [ $SECONDS -lt $END_TIME ]; do
+            sleep 60
+          done
+          echo "Time's up. Shutting down."

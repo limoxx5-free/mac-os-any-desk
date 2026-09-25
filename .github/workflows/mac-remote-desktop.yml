@@ -36,8 +36,8 @@ jobs:
           echo "RUN_DURATION_HOURS=$INT_DURATION" >> "$GITHUB_ENV"
           echo "Desktop will stay active for $INT_DURATION hour(s) (max 6)."
 
-          # Pass the password via env, never via ${{ }} interpolation inside run:
-          # (inline interpolation gets echoed verbatim in the "Run" log header)
+          # Pass the password via env: never interpolate it inline in the script,
+          # because inline interpolation gets echoed verbatim in the "Run" log header
           echo "::add-mask::$INPUT_ANYDESK_PASSWORD"
           if [ -z "$INPUT_ANYDESK_PASSWORD" ]; then
             echo "::error::No password provided. Set the anydesk_password input or the ANYDESK_PASSWORD repository secret."

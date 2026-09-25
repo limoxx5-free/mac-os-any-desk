@@ -1,4 +1,4 @@
-name: macOS Remote Desktop (AnyDesk)
+name: macOS Remote Desktop (VNC via Cloudflare Tunnel)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,12 @@ on:
         description: 'How long the desktop stays active (hours, max 6)'
         required: false
         default: '6'
-      anydesk_password:
-        description: 'AnyDesk password (min 8 chars). Prefer the ANYDESK_PASSWORD repo secret — input values are visible in the run page.'
+      vnc_password:
+        description: 'VNC password (only the first 8 characters are used). Prefer the VNC_PASSWORD repo secret — input values are visible in the run page.'
+        required: false
+        default: ''
+      vnc_hostname:
+        description: 'Public hostname configured in the Cloudflare tunnel (e.g. vnc.example.com). Only used to print the client command.'
         required: false
         default: ''
 
@@ -20,7 +24,8 @@ jobs:
     steps:
       - name: Validate inputs
         env:
-          INPUT_ANYDESK_PASSWORD: ${{ github.event.inputs.anydesk_password || secrets.ANYDESK_PASSWORD }}
+          INPUT_VNC_PASSWORD: ${{ github.event.inputs.vnc_password || secrets.VNC_PASSWORD }}
+          INPUT_VNC_HOST: ${{ github.event.inputs.vnc_hostname }}
         run: |
           DURATION="${{ github.event.inputs.duration }}"
           if [ -z "$DURATION" ]; then
@@ -36,193 +41,144 @@ jobs:
           echo "RUN_DURATION_HOURS=$INT_DURATION" >> "$GITHUB_ENV"
           echo "Desktop will stay active for $INT_DURATION hour(s) (max 6)."
 
-          # Pass the password via env: never interpolate it inline in the script,
-          # because inline interpolation gets echoed verbatim in the "Run" log header
-          echo "::add-mask::$INPUT_ANYDESK_PASSWORD"
-          if [ -z "$INPUT_ANYDESK_PASSWORD" ]; then
-            echo "::error::No password provided. Set the anydesk_password input or the ANYDESK_PASSWORD repository secret."
+          # The legacy VNC protocol authenticates with at most 8 characters
+          echo "::add-mask::$INPUT_VNC_PASSWORD"
+          if [ -z "$INPUT_VNC_PASSWORD" ]; then
+            echo "::error::No VNC password provided. Set the vnc_password input or the VNC_PASSWORD repository secret."
             exit 1
           fi
-          if [ "${#INPUT_ANYDESK_PASSWORD}" -lt 8 ]; then
-            echo "::error::AnyDesk requires a password of at least 8 characters."
-            exit 1
+          VNC_PW="${INPUT_VNC_PASSWORD:0:8}"
+          if [ "$VNC_PW" != "$INPUT_VNC_PASSWORD" ]; then
+            echo "Note: VNC only uses the first 8 characters of the password."
           fi
-          printf 'ANYDESK_PASSWORD=%s\n' "$INPUT_ANYDESK_PASSWORD" >> "$GITHUB_ENV"
+          printf 'VNC_PASSWORD_8=%s\n' "$VNC_PW" >> "$GITHUB_ENV"
+          printf 'VNC_HOST=%s\n' "$INPUT_VNC_HOST" >> "$GITHUB_ENV"
 
           # Job start timestamp: the keepalive step needs it to stop before the 360 min hard limit
           date +%s > /tmp/job_start.txt
 
-      - name: Install AnyDesk
+      - name: Enable Screen Sharing (ARD) and set VNC password
         run: |
-          # Download AnyDesk for macOS
-          curl -L -o AnyDesk.dmg "https://download.anydesk.com/anydesk.dmg"
+          # Apple Remote Desktop is a system daemon: there is no accept/deny dialog,
+          # sessions are authorized with the VNC password only. Nothing to click on the runner.
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          RUNNER_USER="$(whoami)"
 
-          # Mount the DMG
-          hdiutil attach AnyDesk.dmg -nobrowse -mountpoint /tmp/anydesk_mount
+          sudo "$KICKSTART" -activate \
+            -configure -access -on -users "$RUNNER_USER" -privs -all \
+            -restart -agent
+          echo "Remote Management activated for user $RUNNER_USER."
 
-          # Copy the app, then remove quarantine attribute so macOS allows it to run
-          cp -R "/tmp/anydesk_mount/AnyDesk.app" /Applications/
-          xattr -dr com.apple.quarantine /Applications/AnyDesk.app
+          # Enable legacy VNC so any VNC client can connect (Screen Sharing, RealVNC, TigerVNC...)
+          sudo "$KICKSTART" -configure -clientopts \
+            -setvncpw -vncpw "$VNC_PASSWORD_8" \
+            -setvnclegacy -vnclegacy yes \
+            -restart -agent
+          echo "VNC password set (8 chars max)."
 
-          hdiutil detach /tmp/anydesk_mount
-          echo "AnyDesk installed and quarantine removed."
-
-      - name: Grant AnyDesk screen-capture and accessibility permissions (TCC)
-        run: |
-          # Without Screen Recording the remote client sees a black screen,
-          # without Accessibility it cannot send mouse/keyboard input.
-          BID=$(defaults read /Applications/AnyDesk.app/Contents/Info.plist CFBundleIdentifier 2>/dev/null || true)
-          if [ -z "$BID" ] || [ "$BID" = "(null)" ]; then
-            BID="com.anydesk.AnyDesk"
-          fi
-          echo "AnyDesk bundle id: $BID"
-          echo "ANYDESK_BID=$BID" >> "$GITHUB_ENV"
-
-          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
-          grant_tcc() {
-            if sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access(service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified) VALUES('$1','$BID',0,2,2,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null; then
-              echo "Granted $1 to $BID."
-            else
-              echo "::warning::Could not grant $1 in the TCC database. The session may show a black screen or not accept input."
-            fi
-          }
-          grant_tcc kTCCServiceScreenCapture
-          grant_tcc kTCCServiceAccessibility
-          grant_tcc kTCCServiceListenEvent
-
-      - name: Configure AnyDesk for unattended access (no accept prompt)
-        run: |
-          # Create AnyDesk config directory
-          mkdir -p "$HOME/.anydesk"
-
-          # Unattended settings, written to both config files AnyDesk may read.
-          # ad.security.interactive_access → policy for incoming requests:
-          #   0 = always allow (no accept/deny window, no password needed)
-          #   1 = allow when AnyDesk is open    2 = never show (password only)
-          # The macOS CLI cannot set the unattended password headlessly (as user:
-          # "requires administrator privileges"; as root: cannot reach the service),
-          # so policy 0 is what makes this runner usable: connections are accepted
-          # automatically and nothing has to be clicked on the remote side.
-          # ad.features.unattended=true → enable the unattended access feature.
-          cat > "$HOME/.anydesk/system.conf" << 'CONFEOF'
-          ad.anynet.heared_request=false
-          ad.security.password_enabled=true
-          ad.security.interactive_access=0
-          ad.features.unattended=true
-          ad.features.session_recording=false
-          ad.ui.main_dialog.table.column_width.alias=150
-          ad.ui.main_dialog.table.column_width.id=100
-          ad.ui.main_dialog.table.column_width.status=100
-          ad.ui.main_dialog.table.sort_by=1
-          ad.ui.main_dialog.table.sort_order=0
-          CONFEOF
-
-          cp "$HOME/.anydesk/system.conf" "$HOME/.anydesk/user.conf"
-
-          # Mirror the same settings in the app's real defaults domain (bundle id)
-          BID="${ANYDESK_BID:-com.philandro.anydesk}"
-          defaults write "$BID" ad.security.interactive_access -int 0
-          defaults write "$BID" ad.security.password_enabled -bool true
-          defaults write "$BID" ad.features.unattended -bool true
-
-          # NOTE: do NOT store the plain-text password here.
-          # The password hash is set exclusively by the AnyDesk CLI as root in the next step.
-          echo "AnyDesk configured: incoming sessions accepted automatically, nothing to click on the remote side (interactive_access=0)."
-
-      - name: Start AnyDesk and set password via CLI
-        run: |
-          ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
-
-          # Launch AnyDesk in the background
-          nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
-          echo "AnyDesk launched with PID $!"
-
-          # Give it time to initialize and register with the network
-          sleep 15
-
-          # Set the unattended password. The macOS CLI needs BOTH admin rights AND
-          # access to the AnyDesk service inside the runner's GUI session, so try
-          # every combination; each attempt is idempotent. AnyDesk prints the
-          # failure reason, so the result is classified from its output.
-          RUNNER_UID=$(id -u)
-          PW_STATUS="failed"
-          for attempt in 1 2 3; do
-            case "$attempt" in
-              1)
-                echo "--- set-password: launchctl asuser + sudo, stdin ---"
-                printf '%s\n' "$ANYDESK_PASSWORD" | sudo launchctl asuser "$RUNNER_UID" "$ANYDESK_BIN" --set-password > /tmp/pw.log 2>&1 || true
-                ;;
-              2)
-                echo "--- set-password: launchctl asuser + sudo, argument ---"
-                sudo launchctl asuser "$RUNNER_UID" "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" > /tmp/pw.log 2>&1 || true
-                ;;
-              3)
-                echo "--- set-password: plain sudo ---"
-                sudo "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" > /tmp/pw.log 2>&1 || true
-                ;;
-            esac
-            cat /tmp/pw.log
-            if ! grep -qiE 'error|could not|unrecognized|invalid|usage' /tmp/pw.log; then
-              PW_STATUS="set"
+          # Fail fast if nothing is listening instead of burning the whole session
+          for i in $(seq 1 15); do
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "Screen Sharing is listening on 127.0.0.1:5900."
               break
             fi
+            sleep 2
           done
-          echo "AnyDesk unattended password: $PW_STATUS"
-          echo "ANYDESK_PW_STATUS=$PW_STATUS" >> "$GITHUB_ENV"
-          if [ "$PW_STATUS" != "set" ]; then
-            echo "::warning::The unattended password could not be set headlessly. Connections are accepted automatically without password — treat the AnyDesk ID as a secret."
+          if ! nc -z 127.0.0.1 5900 2>/dev/null; then
+            echo "::error::Port 5900 is not listening after enabling Screen Sharing — aborting instead of keeping the runner alive for nothing."
+            lsof -nP -iTCP:5900 || true
+            exit 1
           fi
 
-          # Restart AnyDesk so the password (and the TCC grants) are picked up
-          pkill -f "$ANYDESK_BIN" 2>/dev/null || true
-          sudo pkill -f "$ANYDESK_BIN" 2>/dev/null || true
-          sleep 3
-          nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
+      - name: Install cloudflared
+        run: |
+          brew install cloudflared
+          cloudflared --version
+
+      - name: Start Cloudflare Tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          if [ -n "$TUNNEL_TOKEN" ]; then
+            echo "::add-mask::$TUNNEL_TOKEN"
+            # Named tunnel: the hostname → tcp://localhost:5900 mapping is configured
+            # in the Cloudflare Zero Trust dashboard, not in this command.
+            nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            echo "TUNNEL_MODE=named" >> "$GITHUB_ENV"
+          else
+            echo "::warning::CLOUDFLARE_TUNNEL_TOKEN is not set: falling back to a quick tunnel (random trycloudflare.com address, visible in the public run logs). Set the secret for a stable, private hostname."
+            nohup cloudflared tunnel --no-autoupdate --url tcp://localhost:5900 > /tmp/cloudflared.log 2>&1 &
+            echo "TUNNEL_MODE=quick" >> "$GITHUB_ENV"
+          fi
           sleep 15
 
-          # Retrieve the AnyDesk ID using the CLI
-          ANYDESK_ID=$("$ANYDESK_BIN" --get-id 2>/dev/null || echo "")
-
-          # Fallback: read the ID from the app's real defaults domain (bundle id)
-          if [ -z "$ANYDESK_ID" ]; then
-            ANYDESK_ID=$(defaults read "${ANYDESK_BID:-com.philandro.anydesk}" 2>/dev/null | grep -oE '[0-9]{7,12}' | head -1 || echo "")
+          if ! pgrep -f "cloudflared" > /dev/null 2>&1; then
+            echo "::error::cloudflared exited immediately — check the tunnel token and the hostname configuration."
+            cat /tmp/cloudflared.log
+            exit 1
           fi
 
-          if [ -z "$ANYDESK_ID" ]; then
-            ANYDESK_ID="unknown"
-            echo "::error::Could not read the AnyDesk ID — the client may not have registered with the AnyDesk network."
+          # Quick tunnels print their address to the log; named tunnels keep the dashboard hostname
+          QUICK_ADDR=$(grep -oE 'tcp://[a-z0-9-]+\.trycloudflare\.com(:[0-9]+)?' /tmp/cloudflared.log | head -1 || true)
+          if [ -n "$QUICK_ADDR" ]; then
+            echo "QUICK_ADDR=$QUICK_ADDR" >> "$GITHUB_ENV"
+            echo "Quick tunnel address: $QUICK_ADDR"
           fi
+          tail -20 /tmp/cloudflared.log
 
-          echo "ANYDESK_ID=$ANYDESK_ID" >> "$GITHUB_ENV"
-
-          echo "## AnyDesk Connection Info" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$PW_STATUS" = "set" ]; then
-            echo "**Password:** the one you set when triggering this workflow" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "**Password:** not set (not possible headlessly on a macOS runner)" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "⚠️ Sessions are accepted automatically with no password: anyone with this ID can control the runner, so don't share it and prefer short runs." >> "$GITHUB_STEP_SUMMARY"
-          fi
-          echo "**Max duration:** $RUN_DURATION_HOURS hour(s)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Download the AnyDesk client from https://anydesk.com/downloads and enter the ID above to connect." >> "$GITHUB_STEP_SUMMARY"
-          echo ""
-          echo "::warning::AnyDesk ID: $ANYDESK_ID — use the password you set to connect."
+      - name: Connection instructions
+        run: |
+          {
+            echo "## Remote Desktop — macOS Screen Sharing via Cloudflare"
+            echo ""
+            if [ "$TUNNEL_MODE" = "named" ] && [ -n "$VNC_HOST" ]; then
+              echo "**1)** Sul tuo computer (installa cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/):"
+              echo '```'
+              echo "cloudflared access tcp --hostname $VNC_HOST --url localhost:5900"
+              echo '```'
+              echo ""
+              echo "**2)** Apri Condivisione schermo (Finder → Vai → Connetti al server, oppure ⌘K) e connettiti a:"
+              echo '```'
+              echo "vnc://localhost:5900"
+              echo '```'
+              echo ""
+              echo "**3)** Password VNC: la VNC_PASSWORD che hai configurato (prime 8 lettere)."
+            elif [ "$TUNNEL_MODE" = "named" ]; then
+              echo "Tunnel avviato. Sul tuo computer esegui:"
+              echo '```'
+              echo "cloudflared access tcp --hostname <il tuo hostname configurato nel tunnel> --url localhost:5900"
+              echo '```'
+              echo "Poi apri vnc://localhost:5900 con la password VNC."
+            else
+              echo "Quick tunnel: connettiti direttamente a \`${QUICK_ADDR:-vedi i log)}\` con un qualsiasi client VNC."
+            fi
+            echo ""
+            echo "**Durata massima:** $RUN_DURATION_HOURS ora/e"
+            echo ""
+            echo "Nessuna accettazione richiesta lato runner: ARD autorizza con la sola password VNC."
+            echo "Sicurezza: la password VNC è limitata a 8 caratteri dal protocollo; con una named tunnel protetta da Cloudflare Access il tunnel è privato."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep desktop alive for the configured duration
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
-          # Verify AnyDesk is still running, relaunch if needed
-          ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
-          if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
-            echo "AnyDesk not running, relaunching..."
-            nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
+          KICKSTART="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          relaunch_tunnel() {
+            if [ -n "$TUNNEL_TOKEN" ]; then
+              nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            else
+              nohup cloudflared tunnel --no-autoupdate --url tcp://localhost:5900 > /tmp/cloudflared.log 2>&1 &
+            fi
+          }
+
+          if ! pgrep -f "cloudflared" > /dev/null 2>&1; then
+            echo "cloudflared not running, relaunching..."
+            relaunch_tunnel
             sleep 10
           fi
 
-          # GitHub hard-kills the job at 360 min, so never loop past job start + 350 min.
-          # Before this fix, 6h of keepalive + ~6 min of setup exceeded the limit and got truncated.
+          # GitHub hard-kills the job at 360 min, so never loop past job start + 350 min
           JOB_START=$(cat /tmp/job_start.txt 2>/dev/null || date +%s)
           DESIRED_END=$((JOB_START + RUN_DURATION_HOURS * 3600))
           HARD_END=$((JOB_START + 350 * 60))
@@ -232,13 +188,15 @@ jobs:
             END=$HARD_END
           fi
           echo "Keeping session alive until $(date -r "$END" '+%Y-%m-%d %H:%M:%S')..."
-          echo "AnyDesk ID: $ANYDESK_ID"
 
-          # Keep alive loop — also checks AnyDesk is still running
           while [ "$(date +%s)" -lt "$END" ]; do
-            if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
-              echo "AnyDesk crashed, relaunching..."
-              nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
+            if ! pgrep -f "cloudflared" > /dev/null 2>&1; then
+              echo "cloudflared crashed, relaunching..."
+              relaunch_tunnel
+            fi
+            if ! nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "Screen Sharing not listening, re-arming ARD..."
+              sudo "$KICKSTART" -activate -configure -access -on -users "$(whoami)" -privs -all -restart -agent
             fi
             sleep 60
           done

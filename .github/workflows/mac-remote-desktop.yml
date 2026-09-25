@@ -21,7 +21,6 @@ jobs:
       - name: Validate duration input
         run: |
           DURATION="${{ github.event.inputs.duration }}"
-          # Clamp to max 6 hours
           if [ -z "$DURATION" ]; then
             DURATION=6
           fi
@@ -39,29 +38,60 @@ jobs:
         run: |
           # Download AnyDesk for macOS
           curl -L -o AnyDesk.dmg "https://download.anydesk.com/anydesk.dmg"
-          hdiutil attach AnyDesk.dmg
-          cp -R "/Volumes/AnyDesk/AnyDesk.app" /Applications/
-          hdiutil detach "/Volumes/AnyDesk"
-          echo "AnyDesk installed."
 
-      - name: Start AnyDesk and configure password
+          # Mount the DMG
+          hdiutil attach AnyDesk.dmg -nobrowse -mountpoint /tmp/anydesk_mount
+
+          # Copy the app, then remove quarantine attribute so macOS allows it to run
+          cp -R "/tmp/anydesk_mount/AnyDesk.app" /Applications/
+          xattr -dr com.apple.quarantine /Applications/AnyDesk.app
+
+          hdiutil detach /tmp/anydesk_mount
+          echo "AnyDesk installed and quarantine removed."
+
+      - name: Configure AnyDesk password
         run: |
-          # Launch AnyDesk in the background
-          nohup open -a AnyDesk &
-          sleep 10
-
-          # Set the AnyDesk password via defaults
           ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
+
+          # Set password before launching so it's picked up on first start
+          # AnyDesk stores config in its own plist
           defaults write com.anydesk.AnyDesk password "$ANYDESK_PASSWORD"
+          # Also try the security-based password method
+          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
+          defaults write com.anydesk.AnyDesk ad.security.interactive_access_level 2
 
-          # Restart AnyDesk to apply password
-          killall AnyDesk 2>/dev/null || true
-          sleep 3
-          nohup open -a AnyDesk &
-          sleep 10
+      - name: Start AnyDesk and retrieve ID
+        run: |
+          # Use the AnyDesk CLI binary directly instead of `open -a`
+          ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
 
-          # Retrieve the AnyDesk ID (this machine's address)
-          ANYDESK_ID=$(defaults read com.anydesk.AnyDesk "ADAnyDeskID" 2>/dev/null || echo "unknown")
+          # Launch AnyDesk in the background
+          nohup "$ANYDESK_BIN" &
+          ANYDESK_PID=$!
+          echo "AnyDesk launched with PID $ANYDESK_PID"
+
+          # Give it time to initialize and register with the network
+          sleep 15
+
+          # Retrieve the AnyDesk ID using the CLI
+          ANYDESK_ID=$("$ANYDESK_BIN" --get-id 2>/dev/null || echo "")
+
+          # Fallback: try reading from defaults
+          if [ -z "$ANYDESK_ID" ] || [ "$ANYDESK_ID" = "" ]; then
+            ANYDESK_ID=$(defaults read com.anydesk.AnyDesk "ADAnyDeskID" 2>/dev/null || echo "")
+          fi
+
+          # Fallback 2: try the config file
+          if [ -z "$ANYDESK_ID" ] || [ "$ANYDESK_ID" = "" ]; then
+            ANYDESK_ID=$(grep -o '"id":"[0-9]*"' "$HOME/.anydesk/system.conf" 2>/dev/null | grep -o '[0-9]*' || echo "")
+          fi
+
+          if [ -z "$ANYDESK_ID" ]; then
+            ANYDESK_ID="unknown"
+          fi
+
+          echo "ANYDESK_ID=$ANYDESK_ID" >> $GITHUB_ENV
+
           echo "## AnyDesk Connection Info" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> $GITHUB_STEP_SUMMARY
@@ -74,9 +104,24 @@ jobs:
 
       - name: Keep desktop alive for the configured duration
         run: |
+          # Verify AnyDesk is still running, relaunch if needed
+          ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+          if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
+            echo "AnyDesk not running, relaunching..."
+            nohup "$ANYDESK_BIN" &
+            sleep 10
+          fi
+
           END_TIME=$((SECONDS + RUN_DURATION_HOURS * 3600))
           echo "Keeping session alive for $RUN_DURATION_HOURS hour(s)..."
+          echo "AnyDesk ID: $ANYDESK_ID"
+
+          # Keep alive loop — also checks AnyDesk is still running
           while [ $SECONDS -lt $END_TIME ]; do
+            if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
+              echo "AnyDesk crashed, relaunching..."
+              nohup "$ANYDESK_BIN" &
+            fi
             sleep 60
           done
           echo "Time's up. Shutting down."

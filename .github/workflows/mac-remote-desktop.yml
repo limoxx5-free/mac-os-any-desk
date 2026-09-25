@@ -8,9 +8,9 @@ on:
         required: false
         default: '6'
       anydesk_password:
-        description: 'AnyDesk password (set this to connect)'
-        required: true
-        default: 'changeme'
+        description: 'AnyDesk password (min 8 chars). Prefer the ANYDESK_PASSWORD repo secret — input values are visible in the run page.'
+        required: false
+        default: ''
 
 jobs:
   macos-remote-desktop:
@@ -18,7 +18,9 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Validate duration input
+      - name: Validate inputs
+        env:
+          INPUT_ANYDESK_PASSWORD: ${{ github.event.inputs.anydesk_password || secrets.ANYDESK_PASSWORD }}
         run: |
           DURATION="${{ github.event.inputs.duration }}"
           if [ -z "$DURATION" ]; then
@@ -31,8 +33,24 @@ jobs:
           if [ "$INT_DURATION" -lt 1 ]; then
             INT_DURATION=1
           fi
-          echo "RUN_DURATION_HOURS=$INT_DURATION" >> $GITHUB_ENV
+          echo "RUN_DURATION_HOURS=$INT_DURATION" >> "$GITHUB_ENV"
           echo "Desktop will stay active for $INT_DURATION hour(s) (max 6)."
+
+          # Pass the password via env, never via ${{ }} interpolation inside run:
+          # (inline interpolation gets echoed verbatim in the "Run" log header)
+          echo "::add-mask::$INPUT_ANYDESK_PASSWORD"
+          if [ -z "$INPUT_ANYDESK_PASSWORD" ]; then
+            echo "::error::No password provided. Set the anydesk_password input or the ANYDESK_PASSWORD repository secret."
+            exit 1
+          fi
+          if [ "${#INPUT_ANYDESK_PASSWORD}" -lt 8 ]; then
+            echo "::error::AnyDesk requires a password of at least 8 characters."
+            exit 1
+          fi
+          printf 'ANYDESK_PASSWORD=%s\n' "$INPUT_ANYDESK_PASSWORD" >> "$GITHUB_ENV"
+
+          # Job start timestamp: the keepalive step needs it to stop before the 360 min hard limit
+          date +%s > /tmp/job_start.txt
 
       - name: Install AnyDesk
         run: |
@@ -49,22 +67,43 @@ jobs:
           hdiutil detach /tmp/anydesk_mount
           echo "AnyDesk installed and quarantine removed."
 
-      - name: Configure AnyDesk for unattended access
+      - name: Grant AnyDesk screen-capture and accessibility permissions (TCC)
         run: |
-          ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
+          # Without Screen Recording the remote client sees a black screen,
+          # without Accessibility it cannot send mouse/keyboard input.
+          BID=$(defaults read /Applications/AnyDesk.app/Contents/Info.plist CFBundleIdentifier 2>/dev/null || true)
+          if [ -z "$BID" ] || [ "$BID" = "(null)" ]; then
+            BID="com.anydesk.AnyDesk"
+          fi
+          echo "AnyDesk bundle id: $BID"
 
+          TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          grant_tcc() {
+            if sudo sqlite3 "$TCC_DB" "INSERT OR REPLACE INTO access(service,client,client_type,auth_value,auth_reason,auth_version,csreq,policy_id,indirect_object_identifier_type,indirect_object_identifier,indirect_object_code_identity,flags,last_modified) VALUES('$1','$BID',0,2,2,1,NULL,NULL,0,'UNUSED',NULL,0,strftime('%s','now'));" 2>/dev/null; then
+              echo "Granted $1 to $BID."
+            else
+              echo "::warning::Could not grant $1 in the TCC database. The session may show a black screen or not accept input."
+            fi
+          }
+          grant_tcc kTCCServiceScreenCapture
+          grant_tcc kTCCServiceAccessibility
+          grant_tcc kTCCServiceListenEvent
+
+      - name: Configure AnyDesk for unattended access (no accept prompt)
+        run: |
           # Create AnyDesk config directory
           mkdir -p "$HOME/.anydesk"
 
-          # Write the system config file with unattended access settings
-          # ad.anynet.heared_request = false → don't require user to accept incoming connections
-          # ad.security.password_enabled = true → require password to connect
-          # ad.security.interactive_access_level = 2 → allow full access with password
+          # Unattended settings, written to both config files AnyDesk may read.
+          # ad.security.interactive_access=2 → "Never show incoming session requests":
+          # the remote side NEVER gets an accept/deny window. 0 = always ask,
+          # 1 = ask when AnyDesk is open, 2 = only password-authenticated sessions.
+          # ad.features.unattended=true → enable the unattended access feature.
           cat > "$HOME/.anydesk/system.conf" << 'CONFEOF'
           ad.anynet.heared_request=false
           ad.security.password_enabled=true
-          ad.security.interactive_access_level=2
-          ad.security.auto_allow_incoming_sessions=true
+          ad.security.interactive_access=2
+          ad.features.unattended=true
           ad.features.session_recording=false
           ad.ui.main_dialog.table.column_width.alias=150
           ad.ui.main_dialog.table.column_width.id=100
@@ -73,60 +112,66 @@ jobs:
           ad.ui.main_dialog.table.sort_order=0
           CONFEOF
 
-          # Set the password via defaults (macOS plist)
-          defaults write com.anydesk.AnyDesk password "$ANYDESK_PASSWORD"
-          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
-          defaults write com.anydesk.AnyDesk ad.security.interactive_access_level -int 2
-          defaults write com.anydesk.AnyDesk ad.security.auto_allow_incoming_sessions -bool true
-          defaults write com.anydesk.AnyDesk ad.anynet.heared_request -bool false
+          cp "$HOME/.anydesk/system.conf" "$HOME/.anydesk/user.conf"
 
-          # Also write the password hash into the AnyDesk config file
-          # AnyDesk stores password as a hash — we set it via CLI after launch
-          echo "AnyDesk configured for unattended access."
+          # Mirror the same settings in the macOS defaults domain
+          defaults write com.anydesk.AnyDesk ad.security.interactive_access -int 2
+          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
+          defaults write com.anydesk.AnyDesk ad.features.unattended -bool true
+
+          # NOTE: do NOT store the plain-text password here.
+          # The password hash is set exclusively by the AnyDesk CLI as root in the next step.
+          echo "AnyDesk configured: no on-screen acceptance for incoming sessions (interactive_access=2)."
 
       - name: Start AnyDesk and set password via CLI
         run: |
           ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
-          ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
 
           # Launch AnyDesk in the background
-          nohup "$ANYDESK_BIN" &
-          ANYDESK_PID=$!
-          echo "AnyDesk launched with PID $ANYDESK_PID"
+          nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
+          echo "AnyDesk launched with PID $!"
 
           # Give it time to initialize and register with the network
           sleep 15
 
-          # Set the password using AnyDesk CLI
-          "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" 2>/dev/null || true
-          sleep 5
+          # Setting the unattended password requires administrator privileges
+          # ("ERROR: Setting the password requires administrator privileges 501" without sudo — 501 is the runner UID).
+          # sudo is passwordless on GitHub macOS runners. Try both accepted forms (stdin and argument);
+          # they are idempotent writes of the same password. Output is NOT suppressed so failures are visible.
+          echo "--- set-password (stdin, as root) ---"
+          printf '%s\n' "$ANYDESK_PASSWORD" | sudo "$ANYDESK_BIN" --set-password || true
+          echo "--- set-password (argument, as root) ---"
+          sudo "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" || true
+
+          # Restart AnyDesk so the password (and the TCC grants) are picked up
+          pkill -f "$ANYDESK_BIN" 2>/dev/null || true
+          sudo pkill -f "$ANYDESK_BIN" 2>/dev/null || true
+          sleep 3
+          nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
+          sleep 15
 
           # Retrieve the AnyDesk ID using the CLI
           ANYDESK_ID=$("$ANYDESK_BIN" --get-id 2>/dev/null || echo "")
 
           # Fallback: try reading from defaults
-          if [ -z "$ANYDESK_ID" ] || [ "$ANYDESK_ID" = "" ]; then
+          if [ -z "$ANYDESK_ID" ]; then
             ANYDESK_ID=$(defaults read com.anydesk.AnyDesk "ADAnyDeskID" 2>/dev/null || echo "")
-          fi
-
-          # Fallback 2: try the config file
-          if [ -z "$ANYDESK_ID" ] || [ "$ANYDESK_ID" = "" ]; then
-            ANYDESK_ID=$(grep -o '"id":"[0-9]*"' "$HOME/.anydesk/system.conf" 2>/dev/null | grep -o '[0-9]*' || echo "")
           fi
 
           if [ -z "$ANYDESK_ID" ]; then
             ANYDESK_ID="unknown"
+            echo "::error::Could not read the AnyDesk ID — the client may not have registered with the AnyDesk network."
           fi
 
-          echo "ANYDESK_ID=$ANYDESK_ID" >> $GITHUB_ENV
+          echo "ANYDESK_ID=$ANYDESK_ID" >> "$GITHUB_ENV"
 
-          echo "## AnyDesk Connection Info" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Password:** (the one you set when triggering this workflow)" >> $GITHUB_STEP_SUMMARY
-          echo "**Max duration:** $RUN_DURATION_HOURS hour(s)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download the AnyDesk client from https://anydesk.com/downloads and enter the ID above to connect." >> $GITHUB_STEP_SUMMARY
+          echo "## AnyDesk Connection Info" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**AnyDesk ID / Address:** \`$ANYDESK_ID\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Password:** (the one you set when triggering this workflow)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Max duration:** $RUN_DURATION_HOURS hour(s)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the AnyDesk client from https://anydesk.com/downloads and enter the ID above to connect." >> "$GITHUB_STEP_SUMMARY"
           echo ""
           echo "::warning::AnyDesk ID: $ANYDESK_ID — use the password you set to connect."
 
@@ -136,19 +181,28 @@ jobs:
           ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
           if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
             echo "AnyDesk not running, relaunching..."
-            nohup "$ANYDESK_BIN" &
+            nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
             sleep 10
           fi
 
-          END_TIME=$((SECONDS + RUN_DURATION_HOURS * 3600))
-          echo "Keeping session alive for $RUN_DURATION_HOURS hour(s)..."
+          # GitHub hard-kills the job at 360 min, so never loop past job start + 350 min.
+          # Before this fix, 6h of keepalive + ~6 min of setup exceeded the limit and got truncated.
+          JOB_START=$(cat /tmp/job_start.txt 2>/dev/null || date +%s)
+          DESIRED_END=$((JOB_START + RUN_DURATION_HOURS * 3600))
+          HARD_END=$((JOB_START + 350 * 60))
+          if [ "$DESIRED_END" -lt "$HARD_END" ]; then
+            END=$DESIRED_END
+          else
+            END=$HARD_END
+          fi
+          echo "Keeping session alive until $(date -r "$END" '+%Y-%m-%d %H:%M:%S')..."
           echo "AnyDesk ID: $ANYDESK_ID"
 
           # Keep alive loop — also checks AnyDesk is still running
-          while [ $SECONDS -lt $END_TIME ]; do
+          while [ "$(date +%s)" -lt "$END" ]; do
             if ! pgrep -f "AnyDesk" > /dev/null 2>&1; then
               echo "AnyDesk crashed, relaunching..."
-              nohup "$ANYDESK_BIN" &
+              nohup "$ANYDESK_BIN" >/dev/null 2>&1 &
             fi
             sleep 60
           done

@@ -49,21 +49,45 @@ jobs:
           hdiutil detach /tmp/anydesk_mount
           echo "AnyDesk installed and quarantine removed."
 
-      - name: Configure AnyDesk password
+      - name: Configure AnyDesk for unattended access
         run: |
           ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
 
-          # Set password before launching so it's picked up on first start
-          # AnyDesk stores config in its own plist
-          defaults write com.anydesk.AnyDesk password "$ANYDESK_PASSWORD"
-          # Also try the security-based password method
-          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
-          defaults write com.anydesk.AnyDesk ad.security.interactive_access_level 2
+          # Create AnyDesk config directory
+          mkdir -p "$HOME/.anydesk"
 
-      - name: Start AnyDesk and retrieve ID
+          # Write the system config file with unattended access settings
+          # ad.anynet.heared_request = false → don't require user to accept incoming connections
+          # ad.security.password_enabled = true → require password to connect
+          # ad.security.interactive_access_level = 2 → allow full access with password
+          cat > "$HOME/.anydesk/system.conf" << 'CONFEOF'
+          ad.anynet.heared_request=false
+          ad.security.password_enabled=true
+          ad.security.interactive_access_level=2
+          ad.security.auto_allow_incoming_sessions=true
+          ad.features.session_recording=false
+          ad.ui.main_dialog.table.column_width.alias=150
+          ad.ui.main_dialog.table.column_width.id=100
+          ad.ui.main_dialog.table.column_width.status=100
+          ad.ui.main_dialog.table.sort_by=1
+          ad.ui.main_dialog.table.sort_order=0
+          CONFEOF
+
+          # Set the password via defaults (macOS plist)
+          defaults write com.anydesk.AnyDesk password "$ANYDESK_PASSWORD"
+          defaults write com.anydesk.AnyDesk ad.security.password_enabled -bool true
+          defaults write com.anydesk.AnyDesk ad.security.interactive_access_level -int 2
+          defaults write com.anydesk.AnyDesk ad.security.auto_allow_incoming_sessions -bool true
+          defaults write com.anydesk.AnyDesk ad.anynet.heared_request -bool false
+
+          # Also write the password hash into the AnyDesk config file
+          # AnyDesk stores password as a hash — we set it via CLI after launch
+          echo "AnyDesk configured for unattended access."
+
+      - name: Start AnyDesk and set password via CLI
         run: |
-          # Use the AnyDesk CLI binary directly instead of `open -a`
           ANYDESK_BIN="/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+          ANYDESK_PASSWORD="${{ github.event.inputs.anydesk_password }}"
 
           # Launch AnyDesk in the background
           nohup "$ANYDESK_BIN" &
@@ -72,6 +96,10 @@ jobs:
 
           # Give it time to initialize and register with the network
           sleep 15
+
+          # Set the password using AnyDesk CLI
+          "$ANYDESK_BIN" --set-password "$ANYDESK_PASSWORD" 2>/dev/null || true
+          sleep 5
 
           # Retrieve the AnyDesk ID using the CLI
           ANYDESK_ID=$("$ANYDESK_BIN" --get-id 2>/dev/null || echo "")
